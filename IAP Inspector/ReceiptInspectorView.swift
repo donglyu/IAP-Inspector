@@ -6,7 +6,7 @@ struct ReceiptInspectorView: View {
     var onShowToast: (String) -> Void
 
     @State private var receiptInput = ""
-    @AppStorage("inspector.receipt_shared_secret") private var sharedSecret = ""
+    @State private var sharedSecret = ReceiptSecretStore.read() ?? ""
     @State private var isProcessing = false
     @State private var result: ReceiptInspectionResult?
     @State private var errorMessage: String?
@@ -38,6 +38,7 @@ struct ReceiptInspectorView: View {
             }
         }
         .padding(20)
+        .onAppear(perform: migrateSharedSecretFromUserDefaults)
         .fileImporter(isPresented: $showingFileImporter, allowedContentTypes: [.data, .item], allowsMultipleSelection: false) { outcome in
             switch outcome {
             case .success(let urls):
@@ -65,14 +66,26 @@ struct ReceiptInspectorView: View {
                 Text("支持 Base64 Receipt 离线 ASN.1 深度解码与 Apple verifyReceipt 双环境在线验证").font(.callout).foregroundStyle(.secondary)
             }
             Spacer()
-            if !receiptInput.isEmpty {
-                Button("清空") {
-                    receiptInput = ""
-                    result = nil
-                    errorMessage = nil
+            HStack(spacing: 8) {
+                Button {
+                    if let clip = NSPasteboard.general.string(forType: .string), !clip.isEmpty {
+                        receiptInput = clip
+                    }
+                } label: {
+                    Label("从剪贴板粘贴", systemImage: "doc.on.clipboard")
                 }
-                .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
+                .buttonStyle(.bordered)
+                .help("一键粘贴剪贴板中的 Base64 票据")
+
+                if !receiptInput.isEmpty {
+                    Button("清空") {
+                        receiptInput = ""
+                        result = nil
+                        errorMessage = nil
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                }
             }
         }
     }
@@ -100,7 +113,7 @@ struct ReceiptInspectorView: View {
             HStack(spacing: 12) {
                 HStack(spacing: 6) {
                     Image(systemName: "key.fill").foregroundStyle(.secondary).font(.caption)
-                    TextField("App 专用共享密钥 (Shared Secret，可选)", text: $sharedSecret)
+                    SecureField("App 专用共享密钥 (Shared Secret，可选)", text: $sharedSecret)
                         .textFieldStyle(.plain)
                         .font(.callout)
                 }
@@ -127,11 +140,14 @@ struct ReceiptInspectorView: View {
                 Button {
                     Task { await verifyOnline() }
                 } label: {
-                    Label("在线 verifyReceipt 验证", systemImage: "network")
+                    Label("兼容验证 verifyReceipt（已弃用）", systemImage: "network")
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(receiptInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isProcessing)
             }
+            Label("Apple 已弃用 verifyReceipt。仅用于旧票据兼容排查；新流程优先使用 App Store Server API 或已签名的交易数据。", systemImage: "exclamationmark.triangle")
+                .font(.caption)
+                .foregroundStyle(.orange)
         }
     }
 
@@ -139,7 +155,7 @@ struct ReceiptInspectorView: View {
         ContentUnavailableView {
             Label("从一张 App Store 票据开始", systemImage: "doc.text.magnifyingglass")
         } description: {
-            Text("粘贴客户端导出的 Base64 receipt-data 或拖入 .receipt 原始文件。\n支持无网离线 ASN.1 解码与 Apple 官方在线 verifyReceipt 接口双向排查。")
+            Text("粘贴客户端导出的 Base64 receipt-data 或拖入 .receipt 原始文件。\n支持无网离线 ASN.1 解码；旧票据可用已弃用的 verifyReceipt 接口作兼容排查。")
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -468,10 +484,36 @@ struct ReceiptInspectorView: View {
         }
 
         do {
-            let res = try await verifyService.verify(base64Receipt: trimmed, password: sharedSecret)
+            let secret = sharedSecret.trimmingCharacters(in: .whitespacesAndNewlines)
+            if secret.isEmpty {
+                ReceiptSecretStore.delete()
+            } else {
+                try ReceiptSecretStore.save(secret)
+            }
+            let res = try await verifyService.verify(base64Receipt: trimmed, password: secret)
             result = res
         } catch {
             errorMessage = error.localizedDescription
+        }
+    }
+
+    private func migrateSharedSecretFromUserDefaults() {
+        let defaultsKey = "inspector.receipt_shared_secret"
+        if ReceiptSecretStore.read() != nil {
+            UserDefaults.standard.removeObject(forKey: defaultsKey)
+            return
+        }
+        guard let oldSecret = UserDefaults.standard.string(forKey: defaultsKey), !oldSecret.isEmpty else {
+            UserDefaults.standard.removeObject(forKey: defaultsKey)
+            return
+        }
+        do {
+            try ReceiptSecretStore.save(oldSecret)
+            sharedSecret = oldSecret
+            UserDefaults.standard.removeObject(forKey: defaultsKey)
+        } catch {
+            // Keep the legacy value if Keychain migration fails so it can be retried.
+            return
         }
     }
 

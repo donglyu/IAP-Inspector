@@ -4,7 +4,7 @@ import CryptoKit
 
 enum AppleEnvironment: String, Codable, CaseIterable {
     case production, sandbox
-    var baseURL: URL { URL(string: self == .production ? "https://api.storekit.itunes.apple.com" : "https://api.storekit-sandbox.itunes.apple.com")! }
+    var baseURL: URL { URL(string: self == .production ? "https://api.storekit.apple.com" : "https://api.storekit-sandbox.apple.com")! }
     var title: String { self == .production ? "Production" : "Sandbox" }
 }
 
@@ -126,6 +126,8 @@ struct TransactionSummary: Identifiable, Codable {
     var storefront = ""
     var ownership = ""
     var productType = ""
+    var billingPlanType = ""
+    var commitmentInfo = ""
     var transactionReason = ""
     var refundType = ""
     var refundReason = ""
@@ -147,6 +149,9 @@ struct SubscriptionSummary: Identifiable {
     var productID: String
     var status: String
     var expirationDate: String
+    var billingPlanType = ""
+    var renewalBillingPlanType = ""
+    var renewalCommitmentInfo = ""
 }
 
 struct NotificationSummary: Identifiable {
@@ -183,6 +188,8 @@ struct InspectorResult {
     var timeline: [TimelineEvent]
     var rawJSON: String
     var diagnosticIssues: [DiagnosticIssue]
+    var notificationFailuresOnly: Bool
+    var subscriptionStatuses: [Int]
 
     init(
         environment: AppleEnvironment,
@@ -194,7 +201,9 @@ struct InspectorResult {
         appTransaction: AppTransactionSummary?,
         paginationIncomplete: Bool,
         timeline: [TimelineEvent],
-        rawJSON: String
+        rawJSON: String,
+        notificationFailuresOnly: Bool = false,
+        subscriptionStatuses: [Int] = []
     ) {
         self.environment = environment
         self.summary = summary
@@ -206,6 +215,8 @@ struct InspectorResult {
         self.paginationIncomplete = paginationIncomplete
         self.timeline = timeline
         self.rawJSON = rawJSON
+        self.notificationFailuresOnly = notificationFailuresOnly
+        self.subscriptionStatuses = subscriptionStatuses
         self.diagnosticIssues = DiagnosticAnalyzer.analyze(notifications: notifications, summary: summary, refunds: refunds, subscriptions: subscriptions)
     }
 }
@@ -259,13 +270,47 @@ struct QueryHistoryItem: Identifiable, Codable {
 }
 
 enum QueryHistory {
+    private static let key = "inspector.history"
+    private static let maximumCountKey = "inspector.history.maximumCount"
+    private static let retentionDaysKey = "inspector.history.retentionDays"
+    static let defaultMaximumCount = 100
+    static let defaultRetentionDays = 90
+
+    static var maximumCount: Int {
+        UserDefaults.standard.object(forKey: maximumCountKey) as? Int ?? defaultMaximumCount
+    }
+
+    static var retentionDays: Int {
+        UserDefaults.standard.object(forKey: retentionDaysKey) as? Int ?? defaultRetentionDays
+    }
+
+    static func setPolicy(maximumCount: Int, retentionDays: Int) {
+        UserDefaults.standard.set(maximumCount, forKey: maximumCountKey)
+        UserDefaults.standard.set(retentionDays, forKey: retentionDaysKey)
+    }
+
+    private static func filtered(_ items: [QueryHistoryItem]) -> [QueryHistoryItem] {
+        let filteredByAge: [QueryHistoryItem]
+        if retentionDays == 0 {
+            filteredByAge = items
+        } else {
+            let cutoff = Date.now.addingTimeInterval(-Double(retentionDays) * 24 * 60 * 60)
+            filteredByAge = items.filter { $0.date >= cutoff }
+        }
+        return maximumCount == 0 ? filteredByAge : Array(filteredByAge.prefix(maximumCount))
+    }
+
     static func load() -> [QueryHistoryItem] {
-        guard let data = UserDefaults.standard.data(forKey: "inspector.history") else { return [] }
-        return (try? JSONDecoder().decode([QueryHistoryItem].self, from: data)) ?? []
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let items = try? JSONDecoder().decode([QueryHistoryItem].self, from: data) else { return [] }
+        let retained = filtered(items)
+        if retained.count != items.count { save(retained) }
+        return retained
     }
     static func save(_ items: [QueryHistoryItem]) {
-        guard let data = try? JSONEncoder().encode(items) else { return }
-        UserDefaults.standard.set(data, forKey: "inspector.history")
+        let retained = filtered(items)
+        guard let data = try? JSONEncoder().encode(retained) else { return }
+        UserDefaults.standard.set(data, forKey: key)
     }
 }
 
@@ -451,7 +496,7 @@ final class AppleAPIService {
     private static let currencyFormattersLock = NSLock()
     private static var currencyFormatters: [String: NumberFormatter] = [:]
 
-    func lookup(_ identifier: String, settings: InspectorSettings) async throws -> InspectorResult {
+    func lookup(_ identifier: String, settings: InspectorSettings, subscriptionStatuses: [Int] = [], notificationsOnlyFailures: Bool = false) async throws -> InspectorResult {
         guard settings.isConfigured, KeychainStore.read() != nil else { throw AppleAPIError.missingConfiguration }
         var environments: [AppleEnvironment] = [.production, .sandbox]
         var lastNotFound: Error = AppleAPIError.notFound("4040010")
@@ -463,8 +508,9 @@ final class AppleAPIService {
                 let subjectID = parsed.summary.originalTransactionID.isEmpty ? identifier : parsed.summary.originalTransactionID
                 async let historyRaw = paginatedGET(path: "/inApps/v2/history/\(subjectID)", environment: environment, settings: settings, resultKey: "signedTransactions", tokenKey: "revision")
                 async let refundsRaw = paginatedGET(path: "/inApps/v2/refund/lookup/\(subjectID)", environment: environment, settings: settings, resultKey: "signedTransactions", tokenKey: "revision")
-                async let subscriptionsRaw = request(path: "/inApps/v1/subscriptions/\(subjectID)", environment: environment, settings: settings)
-                async let notificationsRaw = notificationHistory(transactionID: subjectID, environment: environment, settings: settings)
+                let statusQuery = subscriptionStatuses.sorted().map { URLQueryItem(name: "status", value: String($0)) }
+                async let subscriptionsRaw = request(path: "/inApps/v1/subscriptions/\(subjectID)", environment: environment, settings: settings, queryItems: statusQuery)
+                async let notificationsRaw = notificationHistory(transactionID: subjectID, environment: environment, settings: settings, onlyFailures: notificationsOnlyFailures)
                 let auxiliary = try await (historyRaw, refundsRaw, subscriptionsRaw, notificationsRaw)
                 let history = try parseTransactionList(auxiliary.0, key: "signedTransactions", expectedBundleID: settings.bundleID)
                 let refunds = try parseTransactionList(auxiliary.1, key: "signedTransactions", expectedBundleID: settings.bundleID)
@@ -476,7 +522,7 @@ final class AppleAPIService {
                 let rawData = (try? JSONSerialization.data(withJSONObject: combined, options: [.prettyPrinted, .sortedKeys])) ?? Data()
                 var finalSummary = parsed.summary
                 finalSummary.environment = environment.title
-                return InspectorResult(environment: environment, summary: finalSummary, history: history, refunds: refunds, subscriptions: subscriptions, notifications: notifications, appTransaction: nil, paginationIncomplete: paginationIncomplete, timeline: timeline, rawJSON: String(data: rawData, encoding: .utf8) ?? "{}")
+                return InspectorResult(environment: environment, summary: finalSummary, history: history, refunds: refunds, subscriptions: subscriptions, notifications: notifications, appTransaction: nil, paginationIncomplete: paginationIncomplete, timeline: timeline, rawJSON: String(data: rawData, encoding: .utf8) ?? "{}", notificationFailuresOnly: notificationsOnlyFailures, subscriptionStatuses: subscriptionStatuses)
             } catch let error as AppleAPIError {
                 if case .notFound = error { lastNotFound = error; continue }
                 throw error
@@ -485,7 +531,7 @@ final class AppleAPIService {
         throw lastNotFound
     }
 
-    func lookupAppTransactionID(_ identifier: String, settings: InspectorSettings) async throws -> InspectorResult {
+    func lookupAppTransactionID(_ identifier: String, settings: InspectorSettings, subscriptionStatuses: [Int] = [], notificationsOnlyFailures: Bool = false) async throws -> InspectorResult {
         guard settings.isConfigured, KeychainStore.read() != nil else { throw AppleAPIError.missingConfiguration }
         var lastNotFound: Error = AppleAPIError.notFound("4040010")
         for environment in [AppleEnvironment.production, .sandbox] {
@@ -502,10 +548,25 @@ final class AppleAPIService {
                 )
                 let historyRaw = try await paginatedGET(path: "/inApps/v2/history/\(identifier)", environment: environment, settings: settings, resultKey: "signedTransactions", tokenKey: "revision")
                 let history = try parseTransactionList(historyRaw, key: "signedTransactions", expectedBundleID: settings.bundleID)
+                async let refundsRaw = paginatedGET(path: "/inApps/v2/refund/lookup/\(identifier)", environment: environment, settings: settings, resultKey: "signedTransactions", tokenKey: "revision")
+                let statusQuery = subscriptionStatuses.sorted().map { URLQueryItem(name: "status", value: String($0)) }
+                async let subscriptionsRaw = request(path: "/inApps/v1/subscriptions/\(identifier)", environment: environment, settings: settings, queryItems: statusQuery)
+                let auxiliary = try await (refundsRaw, subscriptionsRaw)
+                let refunds = try parseTransactionList(auxiliary.0, key: "signedTransactions", expectedBundleID: settings.bundleID)
+                let subscriptions = parseSubscriptions(auxiliary.1, expectedBundleID: settings.bundleID)
+                let notificationSubject = history.first.map { $0.originalTransactionID.isEmpty ? $0.transactionID : $0.originalTransactionID }
+                let notificationsRaw: [String: Any]
+                if let notificationSubject, !notificationSubject.isEmpty {
+                    notificationsRaw = try await notificationHistory(transactionID: notificationSubject, environment: environment, settings: settings, onlyFailures: notificationsOnlyFailures)
+                } else {
+                    notificationsRaw = ["notificationHistory": [], "hasMore": false, "pagesFetched": 0]
+                }
+                let notifications = try parseNotifications(notificationsRaw, expectedBundleID: settings.bundleID)
                 let summary = history.first ?? TransactionSummary(transactionID: identifier, productID: "App Transaction", productName: "App 下载记录", status: "已查询", purchaseDate: appTransaction.appPurchaseDate, environment: environment.title)
-                let completeRaw: [String: Any] = ["appTransactionInfo": raw, "history": historyRaw]
+                let completeRaw: [String: Any] = ["appTransactionInfo": raw, "history": historyRaw, "refundHistory": auxiliary.0, "subscriptionStatus": auxiliary.1, "notificationHistory": notificationsRaw]
                 let json = try JSONSerialization.data(withJSONObject: completeRaw, options: [.prettyPrinted, .sortedKeys])
-                return InspectorResult(environment: environment, summary: summary, history: history, refunds: [], subscriptions: [], notifications: [], appTransaction: appTransaction, paginationIncomplete: historyRaw["hasMore"] as? Bool == true, timeline: buildTimeline(transactions: history, refunds: [], notifications: []), rawJSON: String(data: json, encoding: .utf8) ?? "{}")
+                let paginationIncomplete = [historyRaw, auxiliary.0, notificationsRaw].contains { $0["hasMore"] as? Bool == true }
+                return InspectorResult(environment: environment, summary: summary, history: history, refunds: refunds, subscriptions: subscriptions, notifications: notifications, appTransaction: appTransaction, paginationIncomplete: paginationIncomplete, timeline: buildTimeline(transactions: history, refunds: refunds, notifications: notifications), rawJSON: String(data: json, encoding: .utf8) ?? "{}", notificationFailuresOnly: notificationsOnlyFailures, subscriptionStatuses: subscriptionStatuses)
             } catch let error as AppleAPIError {
                 if case .notFound = error { lastNotFound = error; continue }
                 throw error
@@ -532,7 +593,7 @@ final class AppleAPIService {
         guard settings.isConfigured, KeychainStore.read() != nil else { throw AppleAPIError.missingConfiguration }
         do { _ = try await request(path: "/inApps/v1/transactions/0", environment: .production, settings: settings) }
         catch let error as AppleAPIError {
-            switch error { case .notFound, .rejected: return; default: throw error }
+            switch error { case .notFound: return; default: throw error }
         }
     }
 
@@ -573,10 +634,11 @@ final class AppleAPIService {
         return page
     }
 
-    private func notificationHistory(transactionID: String, environment: AppleEnvironment, settings: InspectorSettings) async throws -> [String: Any] {
+    private func notificationHistory(transactionID: String, environment: AppleEnvironment, settings: InspectorSettings, onlyFailures: Bool = false) async throws -> [String: Any] {
         let now = Int(Date().timeIntervalSince1970 * 1000)
         let days: Double = environment == .production ? 179 : 29
         var body: [String: Any] = ["startDate": now - Int(days * 24 * 60 * 60 * 1000), "endDate": now, "transactionId": transactionID]
+        if onlyFailures { body["onlyFailures"] = true }
         var records: [[String: Any]] = []
         var page: [String: Any] = [:]
         var token: String?
@@ -598,8 +660,11 @@ final class AppleAPIService {
         return page
     }
 
-    private func request(path: String, environment: AppleEnvironment, settings: InspectorSettings, method: String = "GET", body: [String: Any]? = nil) async throws -> [String: Any] {
-        guard let url = URL(string: path, relativeTo: environment.baseURL) else { throw AppleAPIError.badResponse }
+    private func request(path: String, environment: AppleEnvironment, settings: InspectorSettings, method: String = "GET", body: [String: Any]? = nil, queryItems: [URLQueryItem] = []) async throws -> [String: Any] {
+        guard let baseURL = URL(string: path, relativeTo: environment.baseURL),
+              var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: true) else { throw AppleAPIError.badResponse }
+        if !queryItems.isEmpty { components.queryItems = queryItems }
+        guard let url = components.url else { throw AppleAPIError.badResponse }
         return try await request(url: url, method: method, body: body, environment: environment, settings: settings)
     }
 
@@ -653,7 +718,15 @@ final class AppleAPIService {
             return items.map { item in
                 let state = (item["status"] as? Int).map(subscriptionStatus) ?? "未知"
                 let transaction = ((item["signedTransactionInfo"] as? String).flatMap { try? AppleJWT.verifyAndDecodePayload($0, expectedBundleID: expectedBundleID) }) ?? [:]
-                return SubscriptionSummary(productID: transaction["productId"] as? String ?? "", status: state, expirationDate: dateValue(transaction["expiresDate"]))
+                let renewal = ((item["signedRenewalInfo"] as? String).flatMap { try? AppleJWT.verifyAndDecodePayload($0, expectedBundleID: expectedBundleID) }) ?? [:]
+                return SubscriptionSummary(
+                    productID: transaction["productId"] as? String ?? "",
+                    status: state,
+                    expirationDate: dateValue(transaction["expiresDate"]),
+                    billingPlanType: localizedBillingPlan(transaction["billingPlanType"] as? String),
+                    renewalBillingPlanType: localizedBillingPlan(renewal["renewalBillingPlanType"] as? String),
+                    renewalCommitmentInfo: commitmentDescription(renewal["renewalCommitmentInfo"], currency: renewal["currency"] as? String)
+                )
             }
         }
     }
@@ -768,6 +841,8 @@ final class AppleAPIService {
         let revocationDate = payload["revocationDate"]
         let typeString = payload["type"] as? String ?? ""
         let isSub = typeString == "Auto-Renewable Subscription" || typeString == "Non-Renewing Subscription"
+        let billingPlanType = localizedBillingPlan(payload["billingPlanType"] as? String)
+        let commitmentInfo = commitmentDescription(payload["transactionCommitmentInfo"], currency: payload["currency"] as? String)
 
         return TransactionSummary(
             transactionID: payload["transactionId"] as? String ?? fallbackID,
@@ -784,6 +859,8 @@ final class AppleAPIService {
             storefront: payload["storefront"] as? String ?? "",
             ownership: ownership,
             productType: localizedProductType(typeString),
+            billingPlanType: billingPlanType,
+            commitmentInfo: commitmentInfo,
             transactionReason: localizedTransactionReason(payload["transactionReason"] as? String ?? ""),
             refundType: localizedRevocationType(refundTypeRaw),
             refundReason: refundReasonCode.map(localizedRefundReason) ?? "",
@@ -802,6 +879,24 @@ final class AppleAPIService {
 
     private func localizedProductType(_ value: String) -> String {
         ["Consumable": "消耗型商品", "Non-Consumable": "非消耗型商品", "Auto-Renewable Subscription": "自动续期订阅", "Non-Renewing Subscription": "非续期订阅"][value] ?? value
+    }
+    private func localizedBillingPlan(_ value: String?) -> String {
+        switch value {
+        case "BILLED_UPFRONT": return "预付"
+        case "MONTHLY": return "按月付费"
+        default: return value ?? ""
+        }
+    }
+    private func commitmentDescription(_ value: Any?, currency: String?) -> String {
+        guard let info = value as? [String: Any] else { return "" }
+        var parts: [String] = []
+        if let current = info["billingPeriodNumber"] { parts.append("第 \(current) 期") }
+        if let total = info["totalBillingPeriods"] { parts.append("共 \(total) 期") }
+        let endDate = dateValue(info["commitmentExpiresDate"])
+        if !endDate.isEmpty { parts.append("承诺结束：\(endDate)") }
+        let price = formattedPrice(info["commitmentPrice"] ?? info["commitmentRenewalPrice"], currency: currency)
+        if !price.isEmpty { parts.append("承诺价格：\(price)") }
+        return parts.joined(separator: "，")
     }
     private func localizedTransactionReason(_ value: String) -> String {
         ["PURCHASE": "用户发起购买", "RENEWAL": "订阅自动续期"][value] ?? value
@@ -955,6 +1050,34 @@ enum AppleJWT {
         if let otid = payloadObj["originalTransactionId"] as? String { summaries.append(("Original Transaction ID", otid)) }
         if let bid = payloadObj["bundleId"] as? String { summaries.append(("Bundle ID", bid)) }
         if let pid = payloadObj["productId"] as? String { summaries.append(("Product ID", pid)) }
+        if let value = payloadObj["subscriptionGroupIdentifier"] as? String { summaries.append(("订阅组 ID", value)) }
+        if let value = payloadObj["webOrderLineItemId"] as? String { summaries.append(("订阅订单行 ID", value)) }
+        if let value = payloadObj["storefrontId"] as? String { summaries.append(("商店地区 ID", value)) }
+        if let value = payloadObj["appAccountToken"] as? String { summaries.append(("App Account Token", value)) }
+        if let value = payloadObj["autoRenewProductId"] as? String { summaries.append(("下次续订商品 ID", value)) }
+        if let value = payloadObj["autoRenewStatus"] { summaries.append(("自动续订状态", String(describing: value) == "1" ? "已开启" : "已关闭")) }
+        if let value = payloadObj["isInBillingRetryPeriod"] as? Bool { summaries.append(("是否账单重试", value ? "是" : "否")) }
+        if let value = payloadObj["gracePeriodExpiresDate"] as? NSNumber {
+            let date = Date(timeIntervalSince1970: value.doubleValue / 1000)
+            summaries.append(("宽限期结束时间", date.formatted(.dateTime.locale(Locale(identifier: "zh_CN")).year().month().day().hour().minute().second())))
+        }
+        if let value = payloadObj["offerPeriod"] as? String { summaries.append(("优惠周期", value)) }
+        if let value = payloadObj["transactionReason"] as? String { summaries.append(("交易原因", value == "PURCHASE" ? "用户购买" : value == "RENEWAL" ? "自动续订" : value)) }
+        if let value = payloadObj["billingPlanType"] as? String { summaries.append(("计费计划", value == "BILLED_UPFRONT" ? "预付" : value == "MONTHLY" ? "按月付费" : value)) }
+        if let value = payloadObj["renewalBillingPlanType"] as? String { summaries.append(("续订计费计划", value == "BILLED_UPFRONT" ? "预付" : value == "MONTHLY" ? "按月付费" : value)) }
+        if let value = payloadObj["offerDiscountType"] as? String {
+            let name = ["FREE_TRIAL": "免费试用", "PAY_AS_YOU_GO": "按周期付费优惠", "PAY_UP_FRONT": "预付优惠", "ONE_TIME": "一次性优惠"][value] ?? value
+            summaries.append(("优惠折扣类型", name))
+        }
+        if let value = payloadObj["priceIncreaseStatus"] { summaries.append(("价格调整状态", String(describing: value))) }
+        if let values = payloadObj["eligibleWinBackOfferIds"] as? [String], !values.isEmpty { summaries.append(("符合资格的挽回优惠", values.joined(separator: ", "))) }
+        for (field, title) in [("transactionCommitmentInfo", "交易承诺信息"), ("renewalCommitmentInfo", "续订承诺信息")] {
+            if let value = payloadObj[field], JSONSerialization.isValidJSONObject(value),
+               let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]),
+               let json = String(data: data, encoding: .utf8) {
+                summaries.append((title, json))
+            }
+        }
         if let type = payloadObj["type"] as? String { summaries.append(("Type", type)) }
         if let nType = payloadObj["notificationType"] as? String { summaries.append(("Notification Type", nType)) }
         if let nSub = payloadObj["subtype"] as? String { summaries.append(("Subtype", nSub)) }
@@ -1050,11 +1173,7 @@ private extension Data {
 enum KeychainStore {
     private static let service = "gg.leon.IAP-Inspector.apple-api"
     private static let account = "private-key"
-    private static var cachedValue: String?
-    private static var hasLoadedCache = false
-
     static func read() -> String? {
-        if hasLoadedCache { return cachedValue }
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -1064,12 +1183,9 @@ enum KeychainStore {
         ]
         var result: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
-        hasLoadedCache = true
         guard status == errSecSuccess, let data = result as? Data, let value = String(data: data, encoding: .utf8) else {
-            cachedValue = nil
             return nil
         }
-        cachedValue = value
         return value
     }
     static func save(_ value: String) throws {
@@ -1091,8 +1207,6 @@ enum KeychainStore {
         } else if updateStatus != errSecSuccess {
             throw AppleAPIError.network("无法更新 macOS Keychain（\(updateStatus)）")
         }
-        cachedValue = value
-        hasLoadedCache = true
     }
     static func delete() {
         let query: [String: Any] = [
@@ -1101,7 +1215,51 @@ enum KeychainStore {
             kSecAttrAccount as String: account
         ]
         SecItemDelete(query as CFDictionary)
-        cachedValue = nil
-        hasLoadedCache = true
+    }
+}
+
+enum ReceiptSecretStore {
+    private static let service = "gg.leon.IAP-Inspector.receipt"
+    private static let account = "shared-secret"
+
+    static func read() -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    static func save(_ value: String) throws {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+        let updateStatus = SecItemUpdate(query as CFDictionary, [kSecValueData as String: Data(value.utf8)] as CFDictionary)
+        if updateStatus == errSecItemNotFound {
+            let add = query.merging([
+                kSecValueData as String: Data(value.utf8),
+                kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+            ]) { _, new in new }
+            let status = SecItemAdd(add as CFDictionary, nil)
+            guard status == errSecSuccess else { throw AppleAPIError.network("无法写入 macOS Keychain（\(status)）") }
+        } else if updateStatus != errSecSuccess {
+            throw AppleAPIError.network("无法更新 macOS Keychain（\(updateStatus)）")
+        }
+    }
+
+    static func delete() {
+        SecItemDelete([
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ] as CFDictionary)
     }
 }

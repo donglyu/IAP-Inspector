@@ -12,6 +12,8 @@ enum InspectorSection: Hashable {
 struct ContentView: View {
     @State private var query = ""
     @State private var queryType = QueryType.transaction
+    @State private var notificationsOnlyFailures = false
+    @State private var selectedSubscriptionStatuses: Set<Int> = Set(1...5)
     @State private var selectedSection: InspectorSection = .search
     @State private var showingSettings = false
     @State private var showingProductCatalog = false
@@ -33,32 +35,68 @@ struct ContentView: View {
                     Label("测试通知调试", systemImage: "bell.badge").tag(InspectorSection.notificationTest)
                     Label("最近查询", systemImage: "clock").tag(InspectorSection.history)
                 }
-                Section("配置状态") {
-                    HStack {
-                        Image(systemName: settings.isConfigured ? "checkmark.shield.fill" : "exclamationmark.triangle.fill")
-                            .foregroundStyle(settings.isConfigured ? .green : .orange)
-                        Text(settings.isConfigured ? "Apple API 已就绪" : "未配置 API 凭证")
-                            .font(.callout)
-                            .foregroundStyle(settings.isConfigured ? .primary : .secondary)
+
+                Section("API 配置状态") {
+                    Button {
+                        showingSettings = true
+                    } label: {
+                        HStack(spacing: 8) {
+                            Circle()
+                                .fill(settings.isConfigured ? Color.green : Color.orange)
+                                .frame(width: 8, height: 8)
+                                .shadow(color: (settings.isConfigured ? Color.green : Color.orange).opacity(0.35), radius: 2)
+
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(settings.isConfigured ? "Apple API 已就绪" : "未配置 API 凭证")
+                                    .font(.callout.weight(.medium))
+                                    .foregroundStyle(settings.isConfigured ? Color.primary : Color.orange)
+                                Text(settings.bundleID.isEmpty ? "点击配置密钥与证书" : settings.bundleID)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(.tertiary)
+                        }
+                        .padding(.vertical, 4)
+                        .contentShape(Rectangle())
                     }
+                    .buttonStyle(.plain)
                 }
             }
             .navigationTitle("IAP Inspector")
             .safeAreaInset(edge: .bottom) {
-                VStack(spacing: 4) {
-                    Button { showingProductCatalog = true } label: {
-                        Label("商品库管理", systemImage: "square.grid.2x2")
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    .buttonStyle(.plain).padding(.horizontal, 12).padding(.top, 8)
+                VStack(spacing: 0) {
+                    Divider()
+                    HStack(spacing: 8) {
+                        Button {
+                            showingProductCatalog = true
+                        } label: {
+                            Label("商品库", systemImage: "square.grid.2x2")
+                                .font(.subheadline)
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.regular)
+                        .help("管理 Product ID 与商品名称映射")
 
-                    Button { showingSettings = true } label: {
-                        Label("设置与凭证", systemImage: "gearshape")
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                        Button {
+                            showingSettings = true
+                        } label: {
+                            Label("API 设置", systemImage: "gearshape")
+                                .font(.subheadline)
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.regular)
+                        .help("API 凭证与 Keychain 设置 (⌘,)")
                     }
-                    .buttonStyle(.plain).padding(.horizontal, 12).padding(.bottom, 12)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                    .background(Color(nsColor: .windowBackgroundColor).opacity(0.85))
                 }
-                .background(.background.opacity(0.8))
             }
         } detail: {
             ZStack(alignment: .top) {
@@ -91,7 +129,14 @@ struct ContentView: View {
                             showToast(msg)
                         })
                     case .jwsInspector:
-                        JWSInspectorView()
+                        JWSInspectorView(onInspectTransaction: { tid in
+                            query = tid
+                            queryType = .transaction
+                            selectedSection = .search
+                            Task { await search() }
+                        }, onShowToast: { msg in
+                            showToast(msg)
+                        })
                     case .notificationTest:
                         NotificationTestView(service: service, settings: settings)
                     case .history:
@@ -120,10 +165,7 @@ struct ContentView: View {
             .animation(.easeInOut(duration: 0.2), value: copyBannerText)
         }
         .sheet(isPresented: $showingSettings) {
-            SettingsView(settings: $settings, onOpenProductCatalog: {
-                showingSettings = false
-                showingProductCatalog = true
-            })
+            SettingsView(settings: $settings)
             .frame(width: 520)
             .fixedSize(horizontal: false, vertical: true)
         }
@@ -151,12 +193,6 @@ struct ContentView: View {
                     Text("Apple 交易查询").font(.title2.bold())
                     Text("输入交易 ID 或订单号，快速解析 Apple 侧交易状态与通知轨迹").font(.callout).foregroundStyle(.secondary)
                 }
-                Spacer()
-                Button { showingSettings = true } label: {
-                    Image(systemName: "slider.horizontal.3")
-                }
-                .buttonStyle(.bordered)
-                .help("API 设置")
             }
 
             VStack(alignment: .leading, spacing: 8) {
@@ -194,6 +230,20 @@ struct ContentView: View {
                 .padding(.vertical, 10)
                 .background(.background, in: RoundedRectangle(cornerRadius: 8))
                 .overlay(RoundedRectangle(cornerRadius: 8).stroke(.quaternary))
+
+                Menu {
+                    Toggle("只查询投递失败的通知", isOn: $notificationsOnlyFailures)
+                    Divider()
+                    Text("订阅状态")
+                    ForEach(SubscriptionStatusFilter.allCases, id: \.rawValue) { filter in
+                        Toggle(filter.title, isOn: subscriptionStatusBinding(filter.rawValue))
+                    }
+                    Divider()
+                    Button("全部订阅状态") { selectedSubscriptionStatuses = Set(1...5) }
+                } label: {
+                    Label("查询筛选", systemImage: "line.3.horizontal.decrease.circle")
+                }
+                .menuStyle(.borderlessButton)
             }
         }
         .padding(.horizontal, 20)
@@ -222,21 +272,52 @@ struct ContentView: View {
             let fetched: InspectorResult
             switch searchType {
             case .order: fetched = try await service.lookupOrderID(identifier, settings: settings)
-            case .appTransaction: fetched = try await service.lookupAppTransactionID(identifier, settings: settings)
-            case .transaction: fetched = try await service.lookup(identifier, settings: settings)
+            case .appTransaction: fetched = try await service.lookupAppTransactionID(identifier, settings: settings, subscriptionStatuses: selectedStatusFilters, notificationsOnlyFailures: notificationsOnlyFailures)
+            case .transaction: fetched = try await service.lookup(identifier, settings: settings, subscriptionStatuses: selectedStatusFilters, notificationsOnlyFailures: notificationsOnlyFailures)
             }
             result = fetched
+            let existingNote = history.first {
+                $0.identifier == identifier && $0.queryType == searchType
+            }?.note
             history.removeAll { $0.identifier == identifier && $0.queryType == searchType }
-            history.insert(QueryHistoryItem(identifier: identifier, date: .now, environment: fetched.environment.title, queryType: searchType), at: 0)
-            history = Array(history.prefix(50))
+            history.insert(QueryHistoryItem(identifier: identifier, date: .now, environment: fetched.environment.title, queryType: searchType, note: existingNote), at: 0)
             QueryHistory.save(history)
+            history = QueryHistory.load()
             selectedSection = .search
         } catch {
             errorMessage = error.localizedDescription
-            history.removeAll { $0.identifier == identifier && $0.queryType == searchType }
-            history.insert(QueryHistoryItem(identifier: identifier, date: .now, environment: nil, queryType: searchType), at: 0)
-            history = Array(history.prefix(50))
-            QueryHistory.save(history)
+        }
+    }
+
+    private var selectedStatusFilters: [Int] {
+        selectedSubscriptionStatuses.count == SubscriptionStatusFilter.allCases.count ? [] : selectedSubscriptionStatuses.sorted()
+    }
+
+    private func subscriptionStatusBinding(_ status: Int) -> Binding<Bool> {
+        Binding(
+            get: { selectedSubscriptionStatuses.contains(status) },
+            set: { isSelected in
+                if isSelected { selectedSubscriptionStatuses.insert(status) }
+                else { selectedSubscriptionStatuses.remove(status) }
+            }
+        )
+    }
+}
+
+private enum SubscriptionStatusFilter: Int, CaseIterable {
+    case active = 1
+    case expired = 2
+    case billingRetry = 3
+    case gracePeriod = 4
+    case revoked = 5
+
+    var title: String {
+        switch self {
+        case .active: "有效"
+        case .expired: "已过期"
+        case .billingRetry: "账单重试"
+        case .gracePeriod: "计费宽限期"
+        case .revoked: "已撤销"
         }
     }
 }
@@ -331,7 +412,7 @@ struct ResultView: View {
                 Text("购买历史 (\(result.history.count))").tag(1)
                 Text("退款记录 (\(result.refunds.count))").tag(2)
                 Text("订阅状态 (\(result.subscriptions.count))").tag(3)
-                Text("通知历史 (\(result.notifications.count))").tag(4)
+                Text("\(result.notificationFailuresOnly ? "失败通知" : "通知历史") (\(result.notifications.count))").tag(4)
                 Text("Raw 数据").tag(5)
             }
             .pickerStyle(.segmented)
@@ -363,38 +444,98 @@ struct ResultView: View {
                     statusTile("金额", value: result.summary.price.isEmpty ? "—" : result.summary.price, icon: "dollarsign.circle")
                 }
 
-                GroupBox("交易详细字段") {
-                    Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 10) {
-                        infoRow("本次交易时间", result.summary.purchaseDate)
-                        if !result.summary.originalPurchaseDate.isEmpty {
-                            infoRow("首次购买时间", result.summary.originalPurchaseDate)
+                // 分组 1：核心交易标识 (带一键复制)
+                GroupBox {
+                    VStack(spacing: 8) {
+                        copyableInfoRow("交易 ID (Transaction ID)", result.summary.transactionID)
+                        copyableInfoRow("原始交易 ID (Original ID)", result.summary.originalTransactionID)
+                        if !result.summary.appAccountToken.isEmpty {
+                            copyableInfoRow("App Account Token", result.summary.appAccountToken)
                         }
-                        infoRow("交易 ID", result.summary.transactionID)
-                        infoRow("原始交易 ID", result.summary.originalTransactionID)
-                        infoRow("Bundle ID", result.summary.bundleID)
+                        if !result.summary.bundleID.isEmpty {
+                            copyableInfoRow("Bundle ID", result.summary.bundleID)
+                        }
+                    }
+                    .padding(.vertical, 4)
+                } label: {
+                    Label("核心交易标识", systemImage: "key.fill")
+                        .font(.subheadline.bold())
+                }
+
+                // 分组 2：商品与计费属性
+                GroupBox {
+                    Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 10) {
                         infoRow("商品 ID", result.summary.productID)
                         infoRow("商品类型", result.summary.productType)
+                        if !result.summary.billingPlanType.isEmpty {
+                            infoRow("订阅计费方式", result.summary.billingPlanType)
+                        }
+                        if !result.summary.commitmentInfo.isEmpty {
+                            infoRow("订阅承诺信息", result.summary.commitmentInfo)
+                        }
                         infoRow("交易原因", result.summary.transactionReason)
                         infoRow("商店国家/地区", result.summary.storefront)
                         infoRow("购买方式", result.summary.ownership)
                         infoRow("购买数量", result.summary.quantity)
-                        infoRow("到期时间", result.summary.expirationDate)
-                        infoRow("撤销 / 退款时间", result.summary.revocationDate)
-                        infoRow("退款类型", result.summary.refundType)
-                        infoRow("退款原因", result.summary.refundReason)
-                        infoRow("退款比例", result.summary.refundPercentage)
-                        infoRow("优惠类型", result.summary.offerType)
-                        infoRow("优惠标识", result.summary.offerIdentifier)
-                        infoRow("App Account Token", result.summary.appAccountToken)
+                        if !result.summary.expirationDate.isEmpty {
+                            infoRow("到期时间", result.summary.expirationDate)
+                        }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.vertical, 4)
+                } label: {
+                    Label("商品与计费属性", systemImage: "doc.text.fill")
+                        .font(.subheadline.bold())
                 }
 
-                if let appTransaction = result.appTransaction {
-                    GroupBox("App Transaction 信息") {
+                // 分组 3：退款与撤销详情 (若有退款高亮展示)
+                if !result.summary.revocationDate.isEmpty || !result.summary.refundReason.isEmpty || result.summary.status.contains("退款") {
+                    GroupBox {
                         Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 10) {
-                            infoRow("App Transaction ID", appTransaction.appTransactionID)
+                            infoRow("撤销 / 退款时间", result.summary.revocationDate.isEmpty ? "—" : result.summary.revocationDate)
+                            if !result.summary.refundType.isEmpty {
+                                infoRow("退款类型", result.summary.refundType)
+                            }
+                            if !result.summary.refundReason.isEmpty {
+                                infoRow("退款原因", result.summary.refundReason)
+                            }
+                            if !result.summary.refundPercentage.isEmpty {
+                                infoRow("退款比例", result.summary.refundPercentage)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, 4)
+                    } label: {
+                        Label("退款与撤销详情", systemImage: "exclamationmark.shield.fill")
+                            .font(.subheadline.bold())
+                            .foregroundStyle(.red)
+                    }
+                }
+
+                // 分组 4：优惠与活动 (若有)
+                if !result.summary.offerType.isEmpty || !result.summary.offerIdentifier.isEmpty {
+                    GroupBox {
+                        Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 10) {
+                            if !result.summary.offerType.isEmpty {
+                                infoRow("优惠类型", result.summary.offerType)
+                            }
+                            if !result.summary.offerIdentifier.isEmpty {
+                                infoRow("优惠标识", result.summary.offerIdentifier)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, 4)
+                    } label: {
+                        Label("优惠与促销信息", systemImage: "tag.fill")
+                            .font(.subheadline.bold())
+                    }
+                }
+
+                // 分组 5：App Transaction 信息
+                if let appTransaction = result.appTransaction {
+                    GroupBox {
+                        Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 10) {
+                            copyableInfoRow("App Transaction ID", appTransaction.appTransactionID)
                             infoRow("Bundle ID", appTransaction.bundleID)
                             infoRow("首次下载时间", appTransaction.appPurchaseDate)
                             infoRow("原始 App 版本", appTransaction.originalAppVersion)
@@ -402,10 +543,14 @@ struct ResultView: View {
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.vertical, 4)
+                    } label: {
+                        Label("App Transaction 信息", systemImage: "app.badge.fill")
+                            .font(.subheadline.bold())
                     }
                 }
 
-                GroupBox("交易事件时间线") {
+                // 分组 6：交易事件时间线
+                GroupBox {
                     if result.timeline.isEmpty {
                         Text("暂无可排序的交易事件").foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 6)
                     } else {
@@ -419,10 +564,10 @@ struct ResultView: View {
                                             .frame(width: 20, height: 20)
                                             .background(event.isWarning ? Color.orange.opacity(0.12) : Color.accentColor.opacity(0.1), in: Circle())
                                         if index < result.timeline.count - 1 {
-                                            Rectangle().fill(.quaternary).frame(width: 1, height: 26)
+                                            Rectangle().fill(.quaternary).frame(width: 1, height: 28)
                                         }
                                     }
-                                    VStack(alignment: .leading, spacing: 2) {
+                                    VStack(alignment: .leading, spacing: 3) {
                                         HStack {
                                             Text(event.title).font(.callout.weight(.medium))
                                             Spacer()
@@ -433,16 +578,22 @@ struct ResultView: View {
                                             Text(event.detail).font(.caption2).foregroundStyle(.secondary)
                                         }
                                         if !event.identifier.isEmpty {
-                                            Text(event.identifier).font(.system(.caption2, design: .monospaced)).textSelection(.enabled).foregroundStyle(.secondary)
+                                            HStack(spacing: 6) {
+                                                Text(event.identifier).font(.system(.caption2, design: .monospaced)).textSelection(.enabled).foregroundStyle(.secondary)
+                                                CopyButton(text: event.identifier, onCopied: { onShowToast("已复制: \(event.identifier)") })
+                                            }
                                         }
                                     }
-                                    .padding(.top, 2)
+                                    .padding(.top, 1)
                                 }
                             }
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.vertical, 4)
                     }
+                } label: {
+                    Label("交易事件时间线", systemImage: "timeline.selection")
+                        .font(.subheadline.bold())
                 }
             }
             .padding(.bottom, 16)
@@ -462,6 +613,27 @@ struct ResultView: View {
         .padding(10)
         .background(.background, in: RoundedRectangle(cornerRadius: 8))
         .overlay(RoundedRectangle(cornerRadius: 8).stroke(.quaternary))
+    }
+
+    private func copyableInfoRow(_ title: String, _ value: String) -> some View {
+        HStack {
+            Text(title)
+                .foregroundStyle(.secondary)
+                .font(.callout)
+                .frame(width: 190, alignment: .leading)
+
+            Text(value.isEmpty ? "—" : value)
+                .textSelection(.enabled)
+                .font(.system(.callout, design: .monospaced))
+                .lineLimit(1)
+                .truncationMode(.middle)
+
+            Spacer()
+
+            if !value.isEmpty {
+                CopyButton(text: value, onCopied: { onShowToast("已复制 \(title)") })
+            }
+        }
     }
 
     private func infoRow(_ title: String, _ value: String) -> some View {
@@ -490,9 +662,12 @@ struct ResultView: View {
                                     .background(item.status.contains("退款") ? Color.red.opacity(0.1) : Color.green.opacity(0.1), in: Capsule())
                                     .foregroundStyle(item.status.contains("退款") ? .red : .green)
                             }
-                            Text("交易 ID: \(item.transactionID)")
-                                .font(.system(.caption, design: .monospaced))
-                                .textSelection(.enabled)
+                            HStack(spacing: 6) {
+                                Text("交易 ID: \(item.transactionID)")
+                                    .font(.system(.caption, design: .monospaced))
+                                    .textSelection(.enabled)
+                                CopyButton(text: item.transactionID, onCopied: { onShowToast("已复制交易 ID") })
+                            }
                             HStack(spacing: 12) {
                                 Text("本次交易: \(item.purchaseDate)")
                                 if !item.price.isEmpty { Text("金额: \(item.price)") }
@@ -519,7 +694,12 @@ struct ResultView: View {
                 ContentUnavailableView("没有返回订阅状态", systemImage: "calendar.badge.clock")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                List(result.subscriptions) { item in
+                List {
+                    if !result.subscriptionStatuses.isEmpty {
+                        Text("状态筛选：\(result.subscriptionStatuses.compactMap { SubscriptionStatusFilter(rawValue: $0)?.title }.joined(separator: "、"))")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    ForEach(result.subscriptions) { item in
                     VStack(alignment: .leading, spacing: 6) {
                         HStack {
                             Text(ProductCatalog.lookupName(for: item.productID)).font(.headline)
@@ -530,10 +710,17 @@ struct ResultView: View {
                                 .background(item.status == "有效" ? Color.green.opacity(0.1) : Color.orange.opacity(0.1), in: Capsule())
                                 .foregroundStyle(item.status == "有效" ? .green : .orange)
                         }
-                        Text("Product ID: \(item.productID)").font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary)
+                        HStack(spacing: 6) {
+                            Text("Product ID: \(item.productID)").font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary)
+                            CopyButton(text: item.productID, onCopied: { onShowToast("已复制 Product ID") })
+                        }
                         Text("到期时间：\(item.expirationDate.isEmpty ? "暂无" : item.expirationDate)").font(.caption).foregroundStyle(.secondary)
+                        if !item.billingPlanType.isEmpty { Text("当前计费方式：\(item.billingPlanType)").font(.caption).foregroundStyle(.secondary) }
+                        if !item.renewalBillingPlanType.isEmpty { Text("续订计费方式：\(item.renewalBillingPlanType)").font(.caption).foregroundStyle(.secondary) }
+                        if !item.renewalCommitmentInfo.isEmpty { Text("续订承诺：\(item.renewalCommitmentInfo)").font(.caption).foregroundStyle(.secondary) }
                     }
                     .padding(.vertical, 4)
+                    }
                 }
             }
         }
@@ -545,7 +732,12 @@ struct ResultView: View {
                 ContentUnavailableView("没有返回通知历史", systemImage: "bell.slash", description: Text("Apple 仅保留近 180 天 (Production) 或近 30 天 (Sandbox) 的通知投递记录。"))
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                List(result.notifications) { item in
+                List {
+                    if result.notificationFailuresOnly {
+                        Text("仅显示 Apple 判定未成功投递或仍在重试的通知")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    ForEach(result.notifications) { item in
                     VStack(alignment: .leading, spacing: 6) {
                         HStack {
                             Text(item.type).font(.headline)
@@ -561,6 +753,7 @@ struct ResultView: View {
                         Text(item.rawPayload).font(.system(size: 10, design: .monospaced)).lineLimit(2).textSelection(.enabled).foregroundStyle(.secondary)
                     }
                     .padding(.vertical, 4)
+                    }
                 }
             }
         }
@@ -594,6 +787,8 @@ struct ResultView: View {
 
 // MARK: - JWS Inspector View
 struct JWSInspectorView: View {
+    var onInspectTransaction: ((String) -> Void)? = nil
+    var onShowToast: ((String) -> Void)? = nil
     @State private var inputJWS = ""
     @State private var result: JWSInspectionResult?
     @State private var copyMessage: String?
@@ -606,8 +801,20 @@ struct JWSInspectorView: View {
                     Text("输入 StoreKit 2 或 App Store Server JWS 字符串，离线解码 Payload 并校验 Apple X.509 证书链").font(.callout).foregroundStyle(.secondary)
                 }
                 Spacer()
-                if !inputJWS.isEmpty {
-                    Button("清空") { inputJWS = ""; result = nil }.buttonStyle(.plain).foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    Button {
+                        if let clip = NSPasteboard.general.string(forType: .string), !clip.isEmpty {
+                            inputJWS = clip
+                        }
+                    } label: {
+                        Label("从剪贴板粘贴", systemImage: "doc.on.clipboard")
+                    }
+                    .buttonStyle(.bordered)
+                    .help("一键粘贴剪贴板中的 JWS 字符串")
+
+                    if !inputJWS.isEmpty {
+                        Button("清空") { inputJWS = ""; result = nil }.buttonStyle(.plain).foregroundStyle(.secondary)
+                    }
                 }
             }
 
@@ -661,11 +868,30 @@ struct JWSInspectorView: View {
                         // 快捷提取卡片
                         if !result.summaryItems.isEmpty {
                             GroupBox("提取关键字段") {
-                                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], alignment: .leading, spacing: 8) {
+                                VStack(spacing: 8) {
                                     ForEach(result.summaryItems, id: \.key) { item in
                                         HStack {
-                                            Text(item.key + ":").font(.caption).foregroundStyle(.secondary)
-                                            Text(item.value).font(.caption.bold()).textSelection(.enabled)
+                                            Text(item.key + ":")
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                                .frame(width: 140, alignment: .leading)
+                                            Text(item.value)
+                                                .font(.system(.caption, design: .monospaced).bold())
+                                                .textSelection(.enabled)
+                                                .lineLimit(1)
+                                                .truncationMode(.middle)
+
+                                            Spacer()
+
+                                            CopyButton(text: item.value, onCopied: { onShowToast?("已复制 \(item.key)") })
+
+                                            if (item.key.lowercased().contains("transactionid") || item.key.lowercased().contains("originaltransactionid")) && !item.value.isEmpty {
+                                                Button("在交易查询中查看") {
+                                                    onInspectTransaction?(item.value)
+                                                }
+                                                .buttonStyle(.bordered)
+                                                .controlSize(.small)
+                                            }
                                         }
                                     }
                                 }
@@ -924,6 +1150,9 @@ struct HistoryListView: View {
     @State private var searchText = ""
     @State private var editingItem: QueryHistoryItem?
     @State private var noteText = ""
+    @State private var showingRetentionSettings = false
+    @State private var historyLimit = QueryHistory.maximumCount
+    @State private var historyRetention = QueryHistory.retentionDays
 
     var filteredHistory: [QueryHistoryItem] {
         if searchText.isEmpty { return history }
@@ -938,6 +1167,15 @@ struct HistoryListView: View {
             HStack {
                 Text("最近查询历史").font(.title2.bold())
                 Spacer()
+                Button {
+                    showingRetentionSettings = true
+                } label: {
+                    Label("保留策略", systemImage: "slider.horizontal.3")
+                }
+                .buttonStyle(.bordered)
+                .popover(isPresented: $showingRetentionSettings, arrowEdge: .bottom) {
+                    retentionSettings
+                }
                 if !history.isEmpty {
                     Button("清空历史") {
                         history.removeAll()
@@ -950,6 +1188,11 @@ struct HistoryListView: View {
             }
             .padding(.horizontal, 20)
             .padding(.top, 16)
+
+            Text("\(history.count) 条记录 · \(historyLimitDescription) · \(historyRetentionDescription)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 20)
 
             TextField("搜索历史 ID 或备注...", text: $searchText)
                 .textFieldStyle(.roundedBorder)
@@ -1048,12 +1291,48 @@ struct HistoryListView: View {
             .frame(width: 380)
         }
     }
+
+    private var retentionSettings: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("历史记录保留").font(.headline)
+            Picker("最多保留", selection: $historyLimit) {
+                Text("20 条").tag(20)
+                Text("50 条").tag(50)
+                Text("100 条").tag(100)
+                Text("不限").tag(0)
+            }
+            Picker("自动清理", selection: $historyRetention) {
+                Text("关闭").tag(0)
+                Text("30 天").tag(30)
+                Text("90 天").tag(90)
+                Text("180 天").tag(180)
+            }
+            Text("仅保存查询标识、时间、环境、类型和备注。")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        .padding(16)
+        .frame(width: 260)
+        .onChange(of: historyLimit) { _, _ in saveHistoryPolicy() }
+        .onChange(of: historyRetention) { _, _ in saveHistoryPolicy() }
+    }
+
+    private var historyLimitDescription: String {
+        historyLimit == 0 ? "不限条数" : "最多 \(historyLimit) 条"
+    }
+
+    private var historyRetentionDescription: String {
+        historyRetention == 0 ? "不自动清理" : "保留 \(historyRetention) 天"
+    }
+
+    private func saveHistoryPolicy() {
+        QueryHistory.setPolicy(maximumCount: historyLimit, retentionDays: historyRetention)
+        history = QueryHistory.load()
+    }
 }
 
 // MARK: - Settings View
 struct SettingsView: View {
     @Binding var settings: InspectorSettings
-    var onOpenProductCatalog: () -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var privateKey = KeychainStore.read() ?? ""
     @State private var selectedKeyFile: URL?
@@ -1086,6 +1365,7 @@ struct SettingsView: View {
                     Button("选择 .p8 文件…") { showingImporter = true }
                 }
                 SecureField("或在此粘贴 .p8 内容", text: $privateKey)
+
             }
 
             HStack {
@@ -1093,10 +1373,6 @@ struct SettingsView: View {
                     .buttonStyle(.borderedProminent).disabled(isTesting)
                 if isTesting { ProgressView().controlSize(.small) }
                 Spacer()
-                Button("管理商品映射库") {
-                    onOpenProductCatalog()
-                }
-                .buttonStyle(.bordered)
             }
 
             if let statusMessage {
@@ -1156,3 +1432,43 @@ struct SettingsView: View {
         }
     }
 }
+
+// MARK: - 快捷复制按钮组件
+struct CopyButton: View {
+    let text: String
+    var title: String? = nil
+    var onCopied: (() -> Void)? = nil
+    @State private var isCopied = false
+
+    var body: some View {
+        Button {
+            guard !text.isEmpty else { return }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+            withAnimation(.easeInOut(duration: 0.15)) {
+                isCopied = true
+            }
+            onCopied?()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    isCopied = false
+                }
+            }
+        } label: {
+            HStack(spacing: 3) {
+                Image(systemName: isCopied ? "checkmark" : "doc.on.doc")
+                    .font(.system(size: 11, weight: isCopied ? .bold : .regular))
+                    .foregroundStyle(isCopied ? Color.green : Color.secondary)
+                if let title {
+                    Text(isCopied ? "已复制" : title)
+                        .font(.caption2)
+                        .foregroundStyle(isCopied ? Color.green : Color.secondary)
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(isCopied ? "已复制到剪贴板" : "复制")
+    }
+}
+
