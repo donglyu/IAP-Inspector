@@ -457,15 +457,27 @@ struct JWSInspectionResult {
 
 // MARK: - API Error
 enum AppleAPIError: LocalizedError {
-    case missingConfiguration, invalidKey, invalidSignedData, badResponse, unauthorized, notFound(String), rejected(Int, String), network(String)
+    case missingConfiguration, invalidKey, invalidSignedData, badResponse, invalidTransactionID, notFound(String)
+    case authorizationRejected(statusCode: Int, code: String, message: String, endpoint: String, environment: String)
+    case apiRejected(statusCode: Int, code: String, message: String, endpoint: String, environment: String)
+    case rejected(Int, String), network(String)
     var errorDescription: String? {
         switch self {
         case .missingConfiguration: return "请先在设置中配置 Apple API 凭证。"
         case .invalidKey: return "无法读取 .p8 私钥，请确认使用 App Store Connect In-App Purchase API 私钥。"
         case .invalidSignedData: return "Apple 签名数据未通过证书链或签名校验，已停止解析。"
         case .badResponse: return "Apple 返回了无法识别的数据。"
-        case .unauthorized: return "Apple 拒绝了请求，请检查 Issuer ID、Key ID、私钥和 Bundle ID。"
+        case .invalidTransactionID: return "交易 ID 格式无效，请确认输入的是 Apple 交易 ID（4000006 Invalid transaction id）。"
         case .notFound(let code): return code == "4040010" ? "未找到该交易，请确认 ID 是否正确。" : "Apple 没有找到对应数据（\(code)）。"
+        case .authorizationRejected(let statusCode, let code, let message, let endpoint, let environment):
+            let statusName = statusCode == 401 ? "Unauthorized" : "Forbidden"
+            let suggestion = statusCode == 401
+                ? "检查 In-App Purchase 密钥是否有效，以及 Issuer ID、Key ID、私钥是否属于同一把密钥；同时确认 Bundle ID 正确。"
+                : "检查该密钥是否仍有效、应用是否属于对应开发者团队，以及该操作是否适用于当前环境。"
+            return "Apple 拒绝了授权请求（HTTP \(statusCode) \(statusName)）。\n接口：\(endpoint)\n环境：\(environment)\nApple 错误码：\(code)\nApple 返回：\(message)\n建议：\(suggestion)"
+        case .apiRejected(let statusCode, let code, let message, let endpoint, let environment):
+            let explanation = AppleAPIError.localizedMessage(code: code, status: statusCode)
+            return "\(explanation)\nHTTP 状态：\(statusCode)\n接口：\(endpoint)\n环境：\(environment)\nApple 错误码：\(code)\nApple 返回：\(message)"
         case .rejected(let code, let message):
             let appleCode = message.split(separator: " ", maxSplits: 1).first.map(String.init) ?? ""
             return "\(AppleAPIError.localizedMessage(code: appleCode, status: code))（\(message)）"
@@ -593,7 +605,9 @@ final class AppleAPIService {
         guard settings.isConfigured, KeychainStore.read() != nil else { throw AppleAPIError.missingConfiguration }
         do { _ = try await request(path: "/inApps/v1/transactions/0", environment: .production, settings: settings) }
         catch let error as AppleAPIError {
-            switch error { case .notFound: return; default: throw error }
+            // Apple 接受凭证后会继续校验测试用的占位交易 ID，并以 4000006 拒绝它。
+            // 这与 4040010 一样，说明认证已通过；其他错误仍应显示给用户。
+            switch error { case .notFound, .invalidTransactionID: return; default: throw error }
         }
     }
 
@@ -686,13 +700,30 @@ final class AppleAPIService {
             guard (200..<300).contains(response.statusCode) else {
                 let code = body["errorCode"].map { String(describing: $0) } ?? String(response.statusCode)
                 let message = (body["errorMessage"] as? String) ?? (body["message"] as? String) ?? "请求未成功"
-                if response.statusCode == 401 || response.statusCode == 403 { throw AppleAPIError.unauthorized }
+                let endpoint = Self.endpointDescription(url.path)
+                let environmentName = environment.title
+                if response.statusCode == 401 || response.statusCode == 403 {
+                    throw AppleAPIError.authorizationRejected(statusCode: response.statusCode, code: code, message: message, endpoint: endpoint, environment: environmentName)
+                }
                 if code == "4040010" { throw AppleAPIError.notFound(code) }
-                throw AppleAPIError.rejected(response.statusCode, "\(code) \(message)")
+                if code == "4000006" { throw AppleAPIError.invalidTransactionID }
+                throw AppleAPIError.apiRejected(statusCode: response.statusCode, code: code, message: message, endpoint: endpoint, environment: environmentName)
             }
             return body
         } catch let error as AppleAPIError { throw error }
-        catch { throw AppleAPIError.network(error.localizedDescription) }
+        catch { throw AppleAPIError.network("\(Self.endpointDescription(url.path)) · \(environment.title)：\(error.localizedDescription)") }
+    }
+
+    private static func endpointDescription(_ path: String) -> String {
+        if path.contains("/transactions/appTransactions/") { return "Get App Transaction Info（App 交易信息）" }
+        if path.contains("/transactions/") { return "Get Transaction Info（交易详情）" }
+        if path.contains("/v2/history/") { return "Get Transaction History（购买历史）" }
+        if path.contains("/v2/refund/lookup/") { return "Get Refund History（退款记录）" }
+        if path.contains("/v1/subscriptions/") { return "Get All Subscription Statuses（订阅状态）" }
+        if path.contains("/v1/lookup/") { return "Look Up Order ID（订单号查询）" }
+        if path.contains("/v1/notifications/history") { return "Get Notification History（通知历史）" }
+        if path.contains("/v1/notifications/test") { return "Request Test Notification（测试通知）" }
+        return path
     }
 
     private func parseTransaction(_ raw: Any, fallbackID: String, expectedBundleID: String) throws -> (summary: TransactionSummary, payload: [String: Any]) {

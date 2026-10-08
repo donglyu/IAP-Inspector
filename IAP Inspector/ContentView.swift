@@ -1376,7 +1376,12 @@ struct SettingsView: View {
             }
 
             if let statusMessage {
-                Text(statusMessage).font(.caption).foregroundStyle(statusMessage.hasPrefix("连接成功") ? .green : .red)
+                Text(statusMessage)
+                    .font(.caption)
+                    .foregroundStyle(statusMessage.hasPrefix("连接成功") ? .green : .red)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
             }
 
             HStack {
@@ -1426,7 +1431,7 @@ struct SettingsView: View {
             try KeychainStore.save(key)
             settings.save()
             try await service.testConnection(settings: settings)
-            statusMessage = "连接成功，配置已保存"
+            statusMessage = "连接成功，凭证有效（测试编号无效为预期），配置已保存"
         } catch {
             statusMessage = error.localizedDescription
         }
@@ -1471,4 +1476,3 @@ struct CopyButton: View {
         .help(isCopied ? "已复制到剪贴板" : "复制")
     }
 }
-
