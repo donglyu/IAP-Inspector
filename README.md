@@ -4,6 +4,7 @@ IAP Inspector 是一款 macOS 原生工具，用于查询和排查 Apple App Sto
 
 ## 主要功能
 
+- 导入 Excel / CSV 并选择 transactionId 列，批量补齐 Apple 明细，支持限流重试、断点恢复和 Excel 导出
 - 查询交易、订单、订阅、退款及通知记录
 - 离线解析 App Store Receipt 和 JWS 数据
 - 请求并检查 Apple 测试通知
@@ -26,3 +27,5 @@ xcodebuild -project "IAP Inspector.xcodeproj" \
 ```
 
 详细配置与功能说明见[使用文档](使用文档.md)。
+
+Excel 批量查询、失败重试和导出操作见[批量查询说明](批量查询说明.md)。

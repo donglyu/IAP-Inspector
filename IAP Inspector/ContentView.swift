@@ -3,6 +3,7 @@ import UniformTypeIdentifiers
 
 enum InspectorSection: Hashable {
     case search
+    case reconciliation
     case receiptInspector
     case jwsInspector
     case notificationTest
@@ -10,6 +11,7 @@ enum InspectorSection: Hashable {
 }
 
 struct ContentView: View {
+    @State private var batchModel = TransactionBatchModel()
     @State private var query = ""
     @State private var queryType = QueryType.transaction
     @State private var notificationsOnlyFailures = false
@@ -29,6 +31,7 @@ struct ContentView: View {
         NavigationSplitView {
             List(selection: $selectedSection) {
                 Section("排查工具") {
+                    Label("逐笔对账", systemImage: "checklist").tag(InspectorSection.reconciliation)
                     Label("交易查询", systemImage: "magnifyingglass").tag(InspectorSection.search)
                     Label("票据解析", systemImage: "doc.text.magnifyingglass").tag(InspectorSection.receiptInspector)
                     Label("JWS 离线解析", systemImage: "key.horizontal").tag(InspectorSection.jwsInspector)
@@ -102,6 +105,8 @@ struct ContentView: View {
             ZStack(alignment: .top) {
                 VStack(spacing: 0) {
                     switch selectedSection {
+                    case .reconciliation:
+                        ReconciliationView(settings: settings, model: batchModel)
                     case .search:
                         searchHeader
                         Divider()

@@ -460,6 +460,7 @@ enum AppleAPIError: LocalizedError {
     case missingConfiguration, invalidKey, invalidSignedData, badResponse, invalidTransactionID, notFound(String)
     case authorizationRejected(statusCode: Int, code: String, message: String, endpoint: String, environment: String)
     case apiRejected(statusCode: Int, code: String, message: String, endpoint: String, environment: String)
+    case rateLimited(retryAt: Date?, code: String)
     case rejected(Int, String), network(String)
     var errorDescription: String? {
         switch self {
@@ -481,6 +482,7 @@ enum AppleAPIError: LocalizedError {
         case .rejected(let code, let message):
             let appleCode = message.split(separator: " ", maxSplits: 1).first.map(String.init) ?? ""
             return "\(AppleAPIError.localizedMessage(code: appleCode, status: code))（\(message)）"
+        case .rateLimited(let retryAt, let code): return "Apple 请求限流（\(code)），\(retryAt.map { "请于 " + ISO8601DateFormatter().string(from: $0) + " 后重试" } ?? "请稍后重试")。"
         case .network(let message): return "连接 Apple 失败：\(message)"
         }
     }
@@ -507,6 +509,17 @@ final class AppleAPIService {
     private static let zhCNLocale = Locale(identifier: "zh_CN")
     private static let currencyFormattersLock = NSLock()
     private static var currencyFormatters: [String: NumberFormatter] = [:]
+
+    /// 单笔核验不依赖订阅、通知等辅助接口；环境由操作者明确选择。
+    func reconciliationTransaction(_ identifier: String, environment: AppleEnvironment, settings: InspectorSettings) async throws -> (TransactionSummary, Decimal?, String, String) {
+        guard !identifier.isEmpty, identifier.allSatisfy({ $0.isASCII && $0.isNumber }) else { throw AppleAPIError.invalidTransactionID }
+        guard settings.isConfigured, KeychainStore.read() != nil else { throw AppleAPIError.missingConfiguration }
+        let raw = try await request(path: "/inApps/v1/transactions/\(identifier)", environment: environment, settings: settings)
+        let parsed = try parseTransaction(raw, fallbackID: identifier, expectedBundleID: settings.bundleID)
+        let amount = (parsed.payload["price"] as? NSNumber).map { $0.decimalValue / 1000 }
+        let json = try JSONSerialization.data(withJSONObject: raw, options: [.sortedKeys])
+        return (parsed.summary, amount, parsed.payload["currency"] as? String ?? "", String(decoding: json, as: UTF8.self))
+    }
 
     func lookup(_ identifier: String, settings: InspectorSettings, subscriptionStatuses: [Int] = [], notificationsOnlyFailures: Bool = false) async throws -> InspectorResult {
         guard settings.isConfigured, KeychainStore.read() != nil else { throw AppleAPIError.missingConfiguration }
@@ -686,6 +699,7 @@ final class AppleAPIService {
         guard let key = KeychainStore.read() else { throw AppleAPIError.missingConfiguration }
         let token = try AppleJWT.make(settings: settings, privateKey: key)
         var request = URLRequest(url: url)
+        request.timeoutInterval = 60
         request.httpMethod = method
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -702,6 +716,9 @@ final class AppleAPIService {
                 let message = (body["errorMessage"] as? String) ?? (body["message"] as? String) ?? "请求未成功"
                 let endpoint = Self.endpointDescription(url.path)
                 let environmentName = environment.title
+                if response.statusCode == 429 {
+                    throw AppleAPIError.rateLimited(retryAt: BatchRetryPolicy.retryDate(response.value(forHTTPHeaderField: "Retry-After")), code: code)
+                }
                 if response.statusCode == 401 || response.statusCode == 403 {
                     throw AppleAPIError.authorizationRejected(statusCode: response.statusCode, code: code, message: message, endpoint: endpoint, environment: environmentName)
                 }
@@ -710,7 +727,9 @@ final class AppleAPIService {
                 throw AppleAPIError.apiRejected(statusCode: response.statusCode, code: code, message: message, endpoint: endpoint, environment: environmentName)
             }
             return body
-        } catch let error as AppleAPIError { throw error }
+        } catch is CancellationError { throw CancellationError() }
+        catch let error as URLError where error.code == .cancelled { throw CancellationError() }
+        catch let error as AppleAPIError { throw error }
         catch { throw AppleAPIError.network("\(Self.endpointDescription(url.path)) · \(environment.title)：\(error.localizedDescription)") }
     }
 
